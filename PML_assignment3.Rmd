@@ -1,0 +1,231 @@
+---
+title: "Assessing the Quality of Activity"
+output: html_document
+---
+by clearwriter, February 2016
+
+<h2>Background</h2>
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit, it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement - a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. In this project, your goal will be to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. They were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information on the original research is available from the website here: http://groupware.les.inf.puc-rio.br/har (see the section on the Weight Lifting Exercise Dataset).
+
+<h2>Data Source</h2>
+The training data for this project are available here:
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv
+
+The test data are available here:
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv
+
+The data for this project come from this source: http://groupware.les.inf.puc-rio.br/har. If you use the document you create for this class for any purpose please cite them as they have been very generous in allowing their data to be used for this kind of assignment.
+
+<h2>Load Libraries and Prepare Datasets</h2>
+
+Load libraries first.
+
+```{r}
+library(caret)
+library(parallel)
+library(doParallel)
+library(randomForest)
+library(rpart)
+library(rpart.plot)
+library(RColorBrewer)
+library(sjPlot)
+library(knitr)
+library(captioner)
+library(doMC)
+require(data.table)
+set.seed(1234)
+```
+
+Download testing and training data to your working directory.
+
+```{r}
+## Load training data.
+url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+training <- fread(url)
+url <- "https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+testing <- fread(url)
+dim(training); dim(testing);
+```
+
+<h2>Identify Predictor Candidates</h2>
+Which variables in the test dataset have zero NAs? Use this tip: finding columns with all missing values in r.
+
+Belt, arm, dumbbell, and forearm variables that do not have any missing values in the test dataset will be predictor candidates.
+
+```{r predCandidates}
+isAnyMissing <- sapply(testing, function (x) any(is.na(x) | x == ""))
+isPredictor <- !isAnyMissing & grepl("belt|[^(fore)]arm|dumbbell|forearm", names(isAnyMissing))
+predCandidates <- names(isAnyMissing)[isPredictor]
+predCandidates
+```
+
+Next, we want to subset the primary dataset to include only the predictor candidates and the outcome variable, classe.
+
+```{r}
+varToInclude <- c("classe", predCandidates)
+training <- training[, varToInclude, with=FALSE]
+dim(training)
+```
+
+```{r}
+names(training)
+```
+
+And then we convert classe into a factor.
+
+```{r}
+training <- training[, classe := factor(training[, classe])]
+training[, .N, classe]
+```
+
+As we've learned, we split the dataset into 60/40 training/probing.
+
+```{r}
+inTrain <- createDataPartition(training$classe, p=0.6)
+DTrain <- training[inTrain[[1]]]
+DProbe <- training[-inTrain[[1]]]
+```
+
+We preprocess the prediction variables by centering and scaling.
+
+```{r}
+X <- DTrain[, predCandidates, with=FALSE]
+preProc <- preProcess(X)
+preProc
+```
+
+```{r}
+XCS <- predict(preProc, X)
+DTrainCS <- data.table(data.frame(classe = DTrain[, classe], XCS))
+```
+
+And then apply the centering and scaling to our probing dataset.
+
+```{r}
+X <- DProbe[, predCandidates, with=FALSE]
+XCS <- predict(preProc, X)
+DProbeCS <- data.table(data.frame(classe = DProbe[, classe], XCS))
+```
+
+We also need to check for near zero variance.
+
+```{r}
+nzv <- nearZeroVar(DTrainCS, saveMetrics=TRUE)
+if (any(nzv$nzv)) nzv else message("No variables with near zero variance")
+```
+
+Now, let's examine our groups of prediction variables.
+
+```{r}
+histGroup <- function (data, regex) {
+  col <- grep(regex, names(data))
+  col <- c(col, which(names(data) == "classe"))
+  library(reshape2)
+  n <- nrow(data)
+  DMelted <- melt(data[, col, with=FALSE][, rownum := seq(1, n)], id.vars=c("rownum", "classe"))
+  library(ggplot2)
+  ggplot(DMelted, aes(x=classe, y=value)) +
+    geom_violin(aes(color=classe, fill=classe), alpha=1/2) +
+#     geom_jitter(aes(color=classe, fill=classe), alpha=1/10) +
+#     geom_smooth(aes(group=1), method="gam", color="black", alpha=1/2, size=2) +
+    facet_wrap(~ variable, scale="free_y") +
+    scale_color_brewer(palette="Spectral") +
+    scale_fill_brewer(palette="Spectral") +
+    labs(x="", y="") +
+    theme(legend.position="none")
+}
+histGroup(DTrainCS, "belt")
+```
+
+```{r}
+histGroup(DTrainCS, "[^(fore)]arm")
+```
+
+```{r}
+histGroup(DTrainCS, "dumbbell")
+```
+
+```{r}
+histGroup(DTrainCS, "forearm")
+```
+
+<h2>Training a Prediction Model</h2>
+
+Using a random forest, the out-of-sample error should be small. We'll estimate the error using 40% probing sample. 
+
+Set up the parallel clusters.
+
+```{r}
+cl <- makeCluster(detectCores() - 1)
+registerDoParallel(cl)
+```
+
+Set the control parameters.
+
+```{r}
+ctrl <- trainControl(classProbs=TRUE,
+                     savePredictions=TRUE,
+                     allowParallel=TRUE)
+```
+
+And fit our model over the training parameters. Note: this takes a while.
+
+```{r}
+method <- "rf"
+system.time(trainingModel <- train(classe ~ ., data=DTrainCS, method=method))
+```
+
+```{}
+stopCluster(cl)
+```
+<h2>Evaluate the Training Model</h2>
+
+```{r}
+trainingModel
+```
+
+```{r}
+hat <- predict(trainingModel, DTrainCS)
+confusionMatrix(hat, DTrain[, classe])
+```
+
+<h2>Evaluate the Model Using the Probing Dataset</h2>
+
+```{r}
+hat <- predict(trainingModel, DProbeCS)
+confusionMatrix(hat, DProbeCS[, classe])
+```
+
+<h2>Final Model</h2>
+
+```{r}
+varImp(trainingModel)
+```
+
+```{r}
+trainingModel$finalModel
+```
+
+We have an estimated error rate of less than 1%. Excellent. We'll save this training model for later.
+
+```{r}
+save(trainingModel, file="trainingModel.RData")
+```
+
+<h2>Predictions</h2>
+
+Load the training model.
+
+```{r}
+load(file="trainingModel.RData", verbose=TRUE)
+```
+
+Predict and evaluate.
+
+```{r}
+DTestCS <- predict(preProc, testing[, predCandidates, with=FALSE])
+hat <- predict(trainingModel, DTestCS)
+testing <- cbind(hat , testing)
+subset(testing, select=names(testing)[grep("belt|[^(fore)]arm|dumbbell|forearm", names(testing), invert=TRUE)])
+```
+
